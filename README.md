@@ -2,13 +2,6 @@
 
 Auto-recover Claude Code sessions that get stuck on **transient API errors**.
 
-![demo](demo/demo.gif)
-
-> *Simulated demo — the stuck-state pane is rendered by a stand-in script in
-> `demo/`; the watchdog itself is the actual shipped binary. See `demo/README.md`
-> for how to rebuild. A real-traffic capture follows when the watchdog catches
-> one organically.*
-
 ## The problem
 
 If you run Claude Code in automation — overnight loops, agent fleets, unattended
@@ -73,34 +66,13 @@ not for ongoing production observability.
 
 ## Install
 
-Three ways, pick one.
-
-### As a Claude Code plugin (easiest)
-
-```
-/plugin marketplace add palios-taey/claude-code-api-watchdog
-/plugin install claude-code-api-watchdog@claude-code-api-watchdog
-```
-
-### As a system command (Makefile)
-
-```bash
-git clone https://github.com/palios-taey/claude-code-api-watchdog.git
-cd claude-code-api-watchdog
-sudo make install        # installs to /usr/local/bin
-# or: sudo make install PREFIX=/opt/local
-```
-
-Then run `claude-code-api-watchdog --help`.
-
-### Single-file (no install)
-
 ```bash
 curl -O https://raw.githubusercontent.com/palios-taey/claude-code-api-watchdog/main/watchdog.py
-python3 watchdog.py --help
+# or clone the repo
+git clone https://github.com/palios-taey/claude-code-api-watchdog.git
 ```
 
-It's a single file — copy it anywhere.
+It's a single file. Copy it anywhere.
 
 ## Run
 

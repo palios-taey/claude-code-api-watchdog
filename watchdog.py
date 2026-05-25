@@ -103,7 +103,6 @@ USAGE_LIMIT_PATTERNS = (
     "resets ",                                        # "resets 3:45pm" / "resets Mon 12:00am"
 )
 PROMPT_MARKERS = ("❯", "bypass permissions")
-FEEDBACK_MARKERS = ("How is Claude doing", "Dismiss")
 # Active-generation indicators. When present, Claude is busy working — NOT
 # idle-stuck on an error. Never inject in this state, even if stale error text
 # lingers in scrollback from a just-recovered failure. "esc to interrupt" shows
@@ -189,7 +188,7 @@ class Watchdog:
     # --- detection -----------------------------------------------------------
 
     def _pane_state(self, pane: str) -> str:
-        """Return 'transient' / 'usage_limit' / 'feedback' / 'healthy'.
+        """Return 'transient' / 'usage_limit' / 'healthy'.
 
         All checks operate within PROXIMITY lines of the last prompt marker, so
         error text that has scrolled into history does not trigger recovery.
@@ -211,11 +210,6 @@ class Watchdog:
             return "healthy"
         window = "\n".join(lines[max(0, last_prompt - PROXIMITY): last_prompt + 1])
 
-        # Feedback overlay — use the SAME proximity window as everything else
-        # (don't scan the whole pane, or a session merely displaying the
-        # feedback prompt text triggers a stray "0" submit).
-        if all(m in window for m in FEEDBACK_MARKERS):
-            return "feedback"
         # Usage-limit check first — more specific than transient.
         if any(p in window for p in USAGE_LIMIT_PATTERNS):
             return "usage_limit"

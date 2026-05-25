@@ -67,9 +67,15 @@ class PaneStateClassificationTests(unittest.TestCase):
         pane = "You've hit your session limit · resets 3:45pm\n" "❯ "
         self.assertEqual(self.w._pane_state(pane), "usage_limit")
 
-    def test_feedback_overlay_classified(self):
+    def test_feedback_overlay_markers_no_longer_trigger_special_state(self):
+        # Auto-dismiss of the feedback overlay was removed 2026-05-25 (v0.1.1).
+        # Rationale: the markers "How is Claude doing" + "Dismiss" can co-occur
+        # in normal conversation content, and the dismiss action ("0" + Enter)
+        # was being false-positive-injected into the prompt. YAGNI — feedback
+        # overlay is rare, manual dismissal is fine. These markers must now
+        # classify as 'healthy', not as a separate state.
         pane = "How is Claude doing today?\nDismiss\n" "❯ "
-        self.assertEqual(self.w._pane_state(pane), "feedback")
+        self.assertEqual(self.w._pane_state(pane), "healthy")
 
     def test_working_marker_suppresses_recovery(self):
         # Active-generation marker present → never act, even with stale error

@@ -6,16 +6,26 @@
   },
   "metadata": {
     "description": "Auto-recover Claude Code sessions stuck on transient API errors",
-    "version": "0.1.0"
+    "version": "0.1.1"
   },
   "plugins": [
     {
       "name": "claude-code-api-watchdog",
       "source": "./",
-      "description": "Outer-loop watchdog for unattended tmux Claude Code. Detects transient API-error stalls (429/500/502/503/529/connection-resets — not usage limits), injects Continue with exponential backoff and a 10-retry cap, escalates and stops. Pane-scrape detection with a working-spinner guard. Single file, no third-party Python deps.",
-      "version": "0.1.0",
+      "description": "Outer-loop watchdog for unattended tmux Claude Code. Detects transient API-error stalls (429/500/502/503/529/connection-resets \u2014 not usage limits), injects Continue with exponential backoff and a 10-retry cap, escalates and stops. Pane-scrape detection with a working-spinner guard. Single file, no third-party Python deps.",
+      "version": "0.1.1",
       "category": "devops",
-      "tags": ["claude-code", "watchdog", "api-error-recovery", "tmux", "automation", "exponential-backoff", "retry", "agent", "unattended"],
+      "tags": [
+        "claude-code",
+        "watchdog",
+        "api-error-recovery",
+        "tmux",
+        "automation",
+        "exponential-backoff",
+        "retry",
+        "agent",
+        "unattended"
+      ],
       "author": {
         "name": "PALIOS-TAEY"
       }
