@@ -73,13 +73,34 @@ not for ongoing production observability.
 
 ## Install
 
-```bash
-curl -O https://raw.githubusercontent.com/palios-taey/claude-code-api-watchdog/main/watchdog.py
-# or clone the repo
-git clone https://github.com/palios-taey/claude-code-api-watchdog.git
+Three ways, pick one.
+
+### As a Claude Code plugin (easiest)
+
+```
+/plugin marketplace add palios-taey/claude-code-api-watchdog
+/plugin install claude-code-api-watchdog@claude-code-api-watchdog
 ```
 
-It's a single file. Copy it anywhere.
+### As a system command (Makefile)
+
+```bash
+git clone https://github.com/palios-taey/claude-code-api-watchdog.git
+cd claude-code-api-watchdog
+sudo make install        # installs to /usr/local/bin
+# or: sudo make install PREFIX=/opt/local
+```
+
+Then run `claude-code-api-watchdog --help`.
+
+### Single-file (no install)
+
+```bash
+curl -O https://raw.githubusercontent.com/palios-taey/claude-code-api-watchdog/main/watchdog.py
+python3 watchdog.py --help
+```
+
+It's a single file — copy it anywhere.
 
 ## Run
 

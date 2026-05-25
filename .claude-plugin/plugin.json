@@ -1,0 +1,13 @@
+{
+  "name": "claude-code-api-watchdog",
+  "version": "0.1.0",
+  "description": "Auto-recover Claude Code sessions stuck on transient API errors. Outer-loop watchdog for unattended tmux Claude Code with usage-limit discrimination, exponential backoff, and 10-retry cap. Single file, no third-party deps.",
+  "author": {
+    "name": "PALIOS-TAEY",
+    "url": "https://github.com/palios-taey"
+  },
+  "homepage": "https://github.com/palios-taey/claude-code-api-watchdog",
+  "repository": "https://github.com/palios-taey/claude-code-api-watchdog",
+  "license": "Apache-2.0",
+  "keywords": ["claude-code", "watchdog", "api-error-recovery", "tmux", "automation", "exponential-backoff", "retry", "agent", "unattended"]
+}
