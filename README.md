@@ -2,6 +2,13 @@
 
 Auto-recover Claude Code sessions that get stuck on **transient API errors**.
 
+![demo](demo/demo.gif)
+
+> *Simulated demo — the stuck-state pane is rendered by a stand-in script in
+> `demo/`; the watchdog itself is the actual shipped binary. See `demo/README.md`
+> for how to rebuild. A real-traffic capture follows when the watchdog catches
+> one organically.*
+
 ## The problem
 
 If you run Claude Code in automation — overnight loops, agent fleets, unattended
