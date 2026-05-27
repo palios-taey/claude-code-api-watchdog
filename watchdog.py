@@ -77,6 +77,7 @@ DEFAULT_RESUME_CMD = os.environ.get("CCW_RESUME_CMD", "")
 TRANSIENT_PATTERNS = (
     "API Error: 529",                                 # raw-JSON 529 form
     "API Error: Repeated 529",                        # "Repeated 529 Overloaded errors"
+    "API Error: Overloaded",                          # plain overloaded banner
     "Overloaded errors",                              # the capital-O rendered form
     "overloaded_error",                               # raw JSON body type
     "API Error: Request rejected (429)",              # verbatim official string

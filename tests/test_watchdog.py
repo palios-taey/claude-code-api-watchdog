@@ -55,6 +55,10 @@ class PaneStateClassificationTests(unittest.TestCase):
         pane = "API Error: Repeated 529 Overloaded errors\n" "❯ "
         self.assertEqual(self.w._pane_state(pane), "transient")
 
+    def test_transient_plain_overloaded_near_prompt(self):
+        pane = "API Error: Overloaded\n❯ "
+        self.assertEqual(self.w._pane_state(pane), "transient")
+
     def test_usage_limit_takes_precedence_over_transient(self):
         pane = (
             "API Error: 529\n"
@@ -240,6 +244,7 @@ class PatternListSanityTests(unittest.TestCase):
 
     def test_api_error_anchored_strings_present(self):
         self.assertIn("API Error: 529", wd.TRANSIENT_PATTERNS)
+        self.assertIn("API Error: Overloaded", wd.TRANSIENT_PATTERNS)
         self.assertIn("API Error: Request rejected (429)", wd.TRANSIENT_PATTERNS)
         self.assertIn("Unable to connect to API", wd.TRANSIENT_PATTERNS)
 
