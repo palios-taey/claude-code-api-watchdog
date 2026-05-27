@@ -107,6 +107,22 @@ class PaneStateClassificationTests(unittest.TestCase):
         )
         self.assertEqual(self.w._pane_state(pane), "healthy")
 
+    def test_transient_in_scrollback_sets_error_cleared_flag(self):
+        pane = (
+            "API Error: Request rejected (429)\n"
+            + ("filler line\n" * 25)
+            + "❯ "
+        )
+        flags = self.w._pane_flags(pane)
+        self.assertFalse(flags["transient_near_prompt"])
+        self.assertTrue(flags["transient_anywhere"])
+
+    def test_queued_message_marker_detected(self):
+        pane = "Press up to edit queued messages\n❯ "
+        flags = self.w._pane_flags(pane)
+        self.assertTrue(flags["queued_marker"])
+        self.assertFalse(flags["working"])
+
 
 class BackoffMathTests(unittest.TestCase):
     """_backoff produces exponential delays bounded by RL_BACKOFF_CAP with
@@ -166,6 +182,44 @@ class DryRunInvariantTests(unittest.TestCase):
         finally:
             wd.subprocess.run = original_run
         self.assertEqual(called["count"], 0)
+
+
+class RecentErrorRecoveryTests(unittest.TestCase):
+    def test_stuck_after_error_retries_continue(self):
+        w = wd.Watchdog(sessions=["t"], interval=30, dry_run=True)
+        sends = []
+        w._session_exists = lambda session: True
+        w._claude_running = lambda session: True
+        panes = iter([
+            "API Error: 529\n❯ ",
+            "Press up to edit queued messages\n❯ ",
+            "Press up to edit queued messages\n❯ ",
+        ])
+        w._capture = lambda session, lines=50: next(panes)
+        w._send_continue = lambda session: sends.append(session)
+
+        w.check("t")
+        w.check("t")
+        w.check("t")
+
+        self.assertEqual(sends, ["t"])
+
+    def test_idle_queued_message_prompt_retries_without_recent_error(self):
+        w = wd.Watchdog(sessions=["t"], interval=30, dry_run=True)
+        sends = []
+        w._session_exists = lambda session: True
+        w._claude_running = lambda session: True
+        panes = iter([
+            "Press up to edit queued messages\n❯ ",
+            "Press up to edit queued messages\n❯ ",
+        ])
+        w._capture = lambda session, lines=50: next(panes)
+        w._send_continue = lambda session: sends.append(session)
+
+        w.check("t")
+        w.check("t")
+
+        self.assertEqual(sends, ["t"])
 
 
 class PatternListSanityTests(unittest.TestCase):

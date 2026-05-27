@@ -30,12 +30,17 @@ limit just wastes attempts) and backs off exponentially.
 - Detects a stuck transient-API-error state at the prompt
 - Requires the transient-error state on **two consecutive polls** before acting
   (debounce against single-frame redraws and momentarily-displayed error text)
+- Logs every poll in a machine-greppable line:
+  `"[<ts>] [watchdog] poll session=<X> state=<healthy|error_visible|error_cleared|stuck_after_error|no_progress> action=<none|wait|continue|reset>"`
 - Injects `Continue` with **exponential backoff** (2s → 4s → … → 120s cap) and a
   **10-attempt cap**, then escalates and stops (no infinite hammering within an
   error episode; a session that flaps healthy↔error re-arms per episode)
 - Pre-clears the input line before typing `Continue`, so a misfire can't append
   to a half-typed human instruction
 - Resets the moment the error clears, so the next error starts fresh
+- Detects the known post-error queued-message stall (`Press up to edit queued
+  messages`) and retries `Continue` if Claude cleared the visible error but did
+  not actually resume
 - Leaves **real usage limits** alone (detects the "resets at X" / "Rate limit
   reached" state and waits instead of spamming)
 - Dismisses the "How is Claude doing?" feedback overlay if it blocks the prompt
@@ -141,6 +146,8 @@ systemctl --user enable --now claude-code-api-watchdog
 | — | `CCW_BACKOFF_BASE` | `2` | backoff base seconds |
 | — | `CCW_BACKOFF_CAP` | `120` | backoff cap seconds |
 | — | `CCW_PROXIMITY` | `20` | error must be within N lines of the prompt to count |
+| — | `CCW_RECENT_ERROR_POLLS` | `4` | keep a cleared error episode "hot" for N polls |
+| — | `CCW_STUCK_AFTER_ERROR_POLLS` | `1` | repeated queued-message stall polls before retrying `Continue` |
 | — | `CCW_DEAD_THRESHOLD` | `300` | seconds without a Claude process before restart |
 
 ## How detection works (and its limits)
@@ -158,6 +165,10 @@ the prompt marker. It is deliberately conservative on several axes:
 - The state must persist across `CCW_CONFIRM_POLLS` (default 2) consecutive polls
   before any keystroke is sent — a single-frame redraw or a momentarily-shown
   error won't act.
+- If a transient error is still visible in recent scrollback but no longer near
+  the prompt, the poll log reports `state=error_cleared`; if Claude then lands
+  in the queued-message prompt instead of resuming, the watchdog reports
+  `state=stuck_after_error` and retries `Continue`.
 - Before typing `Continue`, the input line is cleared (`Ctrl-U`) so a misfire
   can't append to a half-typed human instruction.
 

@@ -108,8 +108,11 @@ PROMPT_MARKERS = ("❯", "bypass permissions")
 # lingers in scrollback from a just-recovered failure. "esc to interrupt" shows
 # only while Claude is generating; absent at an idle prompt (verified 2026-05-22).
 WORKING_MARKERS = ("esc to interrupt", "to interrupt")
+QUEUED_MARKERS = ("Press up to edit queued messages",)
 
 PROXIMITY = int(os.environ.get("CCW_PROXIMITY", "20"))
+RECENT_ERROR_POLLS = int(os.environ.get("CCW_RECENT_ERROR_POLLS", "4"))
+STUCK_AFTER_ERROR_POLLS = int(os.environ.get("CCW_STUCK_AFTER_ERROR_POLLS", "1"))
 
 
 class Watchdog:
@@ -134,6 +137,9 @@ class Watchdog:
         self.rl_escalated: Dict[str, bool] = {}
         self.pending_transient: Dict[str, int] = {}   # consecutive transient polls
         self.restart_count: Dict[str, int] = {}
+        self.last_fingerprint: Dict[str, str] = {}
+        self.stagnant_polls: Dict[str, int] = {}
+        self.recent_error_polls: Dict[str, int] = {}
 
     # --- tmux helpers --------------------------------------------------------
 
@@ -217,6 +223,35 @@ class Watchdog:
             return "transient"
         return "healthy"
 
+    def _pane_flags(self, pane: str) -> Dict[str, bool]:
+        state = self._pane_state(pane)
+        return {
+            "working": any(m in pane for m in WORKING_MARKERS) if pane else False,
+            "transient_near_prompt": state == "transient",
+            "usage_limit": state == "usage_limit",
+            "transient_anywhere": any(p in pane for p in TRANSIENT_PATTERNS) if pane else False,
+            "queued_marker": any(m in pane for m in QUEUED_MARKERS) if pane else False,
+        }
+
+    def _pane_fingerprint(self, pane: str) -> str:
+        if not pane:
+            return ""
+        return "\n".join(line.rstrip() for line in pane.splitlines()[-12:]).strip()
+
+    def _note_progress(self, session: str, pane: str) -> bool:
+        fingerprint = self._pane_fingerprint(pane)
+        previous = self.last_fingerprint.get(session)
+        self.last_fingerprint[session] = fingerprint
+        if previous is None or fingerprint != previous:
+            self.stagnant_polls[session] = 0
+            return True
+        self.stagnant_polls[session] = self.stagnant_polls.get(session, 0) + 1
+        return False
+
+    def _poll_log(self, session: str, state: str, action: str) -> None:
+        ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        log.info(f"[{ts}] [watchdog] poll session={session} state={state} action={action}")
+
     # --- recovery actions ----------------------------------------------------
 
     def _backoff(self, attempts: int) -> float:
@@ -237,7 +272,7 @@ class Watchdog:
         time.sleep(0.1)
         self._send(session, "-H", "1b", "5b", "31", "33", "75", desc="submit (CSI-u Enter)")
 
-    def _handle_transient(self, session: str) -> None:
+    def _handle_transient(self, session: str, reason: str) -> str:
         now = time.time()
         attempts = self.rl_attempts.get(session, 0)
         last = self.rl_cooldown.get(session, 0.0)
@@ -249,15 +284,16 @@ class Watchdog:
                 log.error(msg)
                 self._escalate(msg)
                 self.rl_escalated[session] = True
-            return
+            return "wait"
 
         if now - last < self._backoff(attempts):
-            return
-        log.info(f"{session}: transient API error (confirmed across {CONFIRM_POLLS} "
-                 f"polls) — Continue {attempts + 1}/{RL_MAX_ATTEMPTS}")
+            return "wait"
+        log.info(f"{session}: {reason} — Continue {attempts + 1}/{RL_MAX_ATTEMPTS}")
         self._send_continue(session)
         self.rl_cooldown[session] = now
         self.rl_attempts[session] = attempts + 1
+        self.recent_error_polls[session] = RECENT_ERROR_POLLS
+        return "continue"
 
     def _dismiss_feedback(self, session: str) -> None:
         log.info(f"{session}: dismissing feedback overlay")
@@ -269,6 +305,7 @@ class Watchdog:
         self.rl_attempts[session] = 0
         self.rl_cooldown[session] = 0.0
         self.rl_escalated[session] = False
+        self.recent_error_polls[session] = 0
 
     def _restart(self, session: str) -> None:
         if session in self.no_restart or not self.resume_cmd:
@@ -315,6 +352,9 @@ class Watchdog:
             if idle > DEAD_THRESHOLD:
                 log.warning(f"{session}: no Claude process for {idle:.0f}s")
                 self._restart(session)
+                self._poll_log(session, "no_progress", "reset")
+            else:
+                self._poll_log(session, "no_progress", "wait")
             return
 
         # Claude is alive — safe to do pane-state recovery.
@@ -322,26 +362,88 @@ class Watchdog:
         self.restart_count[session] = 0
 
         pane = self._capture(session)
-        state = self._pane_state(pane)
+        flags = self._pane_flags(pane)
+        progress = self._note_progress(session, pane)
+        state = "healthy"
+        action = "none"
+
+        if flags["usage_limit"]:
+            self.pending_transient[session] = 0
+            if self.rl_attempts.get(session):
+                action = "reset"
+                self._reset_rl(session)
+            self._poll_log(session, state, action)
+            return
 
         if state == "feedback":
             self.pending_transient[session] = 0
             self._dismiss_feedback(session)
-        elif state == "transient":
+            self._poll_log(session, state, "none")
+            return
+
+        if flags["transient_near_prompt"]:
             # Debounce: require CONFIRM_POLLS consecutive transient detections
             # before acting. Single-frame redraws / momentarily-displayed error
             # text won't reach the threshold.
             pending = self.pending_transient.get(session, 0) + 1
             self.pending_transient[session] = pending
+            self.recent_error_polls[session] = RECENT_ERROR_POLLS
+            state = "error_visible"
             if pending >= CONFIRM_POLLS:
-                self._handle_transient(session)
+                action = self._handle_transient(
+                    session,
+                    f"transient API error (confirmed across {CONFIRM_POLLS} polls)",
+                )
             else:
                 log.info(f"{session}: transient error seen ({pending}/{CONFIRM_POLLS}) "
                          f"— waiting for confirmation before acting")
-        else:
-            # healthy or usage_limit → not a transient-recovery situation
-            self.pending_transient[session] = 0
+                action = "wait"
+            self._poll_log(session, state, action)
+            return
+
+        self.pending_transient[session] = 0
+
+        if (
+            flags["queued_marker"]
+            and not flags["working"]
+            and self.stagnant_polls.get(session, 0) >= STUCK_AFTER_ERROR_POLLS
+        ):
+            state = "stuck_after_error"
+            action = self._handle_transient(session, "idle queued-message prompt stalled")
+            self._poll_log(session, state, action)
+            return
+
+        recent_error = (
+            self.recent_error_polls.get(session, 0) > 0
+            or flags["transient_anywhere"]
+            or bool(self.rl_attempts.get(session))
+        )
+        if recent_error:
+            self.recent_error_polls[session] = max(self.recent_error_polls.get(session, 0) - 1, 0)
+            if flags["queued_marker"] and self.stagnant_polls.get(session, 0) >= STUCK_AFTER_ERROR_POLLS:
+                state = "stuck_after_error"
+                action = self._handle_transient(session, "stuck after error cleared into queued-message prompt")
+            elif flags["transient_anywhere"]:
+                state = "error_cleared"
+                action = "wait"
+                if progress and not flags["queued_marker"] and self.rl_attempts.get(session):
+                    action = "reset"
+                    self._reset_rl(session)
+            elif self.stagnant_polls.get(session, 0) >= STUCK_AFTER_ERROR_POLLS and self.rl_attempts.get(session):
+                state = "no_progress"
+                action = "wait"
+            else:
+                if progress and self.rl_attempts.get(session):
+                    action = "reset"
+                    self._reset_rl(session)
+                state = "healthy"
+            self._poll_log(session, state, action)
+            return
+
+        if self.rl_attempts.get(session):
+            action = "reset"
             self._reset_rl(session)
+        self._poll_log(session, state, action)
 
     def run(self) -> None:
         log.info(f"started{' [DRY-RUN]' if self.dry_run else ''}: sessions={self.sessions} "
