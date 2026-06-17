@@ -19,6 +19,10 @@ in the README). To be safe it requires the error state to persist across two
 consecutive polls before acting, and you can run it with --dry-run first to see
 exactly what it WOULD do without sending a single keystroke.
 
+If a pane scores healthy but stops changing, the watchdog writes a rate-limited
+forensic snapshot to CCW_FORENSIC_LOG. Add new transient patterns only from a
+real captured string in that log, not from guesses.
+
 Requirements:
   - Your Claude Code sessions run inside named tmux sessions.
   - Python 3.10+. No third-party dependencies at all. Escalation, if you want
@@ -33,6 +37,7 @@ This file is standalone — copy it anywhere and run it. Apache-2.0.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import random
@@ -114,6 +119,14 @@ QUEUED_MARKERS = ("Press up to edit queued messages",)
 PROXIMITY = int(os.environ.get("CCW_PROXIMITY", "20"))
 RECENT_ERROR_POLLS = int(os.environ.get("CCW_RECENT_ERROR_POLLS", "4"))
 STUCK_AFTER_ERROR_POLLS = int(os.environ.get("CCW_STUCK_AFTER_ERROR_POLLS", "1"))
+FORENSIC_LOG = os.path.expanduser(
+    os.environ.get("CCW_FORENSIC_LOG", "~/.cache/claude-code-watchdog/forensic.log")
+)
+FORENSIC_MAX_BYTES = int(os.environ.get("CCW_FORENSIC_MAX_BYTES", "1048576"))
+FORENSIC_CAPTURE_LINES = int(os.environ.get("CCW_FORENSIC_CAPTURE_LINES", "20"))
+FORENSIC_STAGNANT_POLLS = int(
+    os.environ.get("CCW_FORENSIC_STAGNANT_POLLS", str(STUCK_AFTER_ERROR_POLLS))
+)
 
 
 class Watchdog:
@@ -141,6 +154,7 @@ class Watchdog:
         self.last_fingerprint: Dict[str, str] = {}
         self.stagnant_polls: Dict[str, int] = {}
         self.recent_error_polls: Dict[str, int] = {}
+        self.forensic_dumped: Dict[str, bool] = {}
 
     # --- tmux helpers --------------------------------------------------------
 
@@ -207,15 +221,9 @@ class Watchdog:
         # just-recovered failure.
         if any(m in pane for m in WORKING_MARKERS):
             return "healthy"
-        lines = pane.split("\n")
-        last_prompt = -1
-        for i in range(len(lines) - 1, -1, -1):
-            if any(m in lines[i] for m in PROMPT_MARKERS):
-                last_prompt = i
-                break
-        if last_prompt < 0:
+        window = self._pane_scored_window(pane)
+        if not window:
             return "healthy"
-        window = "\n".join(lines[max(0, last_prompt - PROXIMITY): last_prompt + 1])
 
         # Usage-limit check first — more specific than transient.
         if any(p in window for p in USAGE_LIMIT_PATTERNS):
@@ -234,6 +242,19 @@ class Watchdog:
             "queued_marker": any(m in pane for m in QUEUED_MARKERS) if pane else False,
         }
 
+    def _pane_scored_window(self, pane: str) -> str:
+        if not pane:
+            return ""
+        lines = pane.split("\n")
+        last_prompt = -1
+        for i in range(len(lines) - 1, -1, -1):
+            if any(m in lines[i] for m in PROMPT_MARKERS):
+                last_prompt = i
+                break
+        if last_prompt < 0:
+            return ""
+        return "\n".join(lines[max(0, last_prompt - PROXIMITY): last_prompt + 1])
+
     def _pane_fingerprint(self, pane: str) -> str:
         if not pane:
             return ""
@@ -245,6 +266,7 @@ class Watchdog:
         self.last_fingerprint[session] = fingerprint
         if previous is None or fingerprint != previous:
             self.stagnant_polls[session] = 0
+            self.forensic_dumped[session] = False
             return True
         self.stagnant_polls[session] = self.stagnant_polls.get(session, 0) + 1
         return False
@@ -252,6 +274,59 @@ class Watchdog:
     def _poll_log(self, session: str, state: str, action: str) -> None:
         ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         log.info(f"[{ts}] [watchdog] poll session={session} state={state} action={action}")
+
+    def _captured_tail(self, pane: str) -> str:
+        if not pane:
+            return ""
+        return "\n".join(pane.splitlines()[-FORENSIC_CAPTURE_LINES:])
+
+    def _rotate_forensic_log(self, path: str) -> None:
+        if FORENSIC_MAX_BYTES <= 0 or not os.path.exists(path):
+            return
+        if os.path.getsize(path) < FORENSIC_MAX_BYTES:
+            return
+        rotated = f"{path}.1"
+        if os.path.exists(rotated):
+            os.remove(rotated)
+        os.replace(path, rotated)
+
+    def _write_forensic_record(self, record: Dict[str, object]) -> None:
+        path = FORENSIC_LOG
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        self._rotate_forensic_log(path)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, sort_keys=True) + "\n")
+
+    def _maybe_dump_forensic(self, session: str, pane: str, flags: Dict[str, bool], action: str) -> None:
+        stagnant = self.stagnant_polls.get(session, 0)
+        if stagnant <= 0 or stagnant < FORENSIC_STAGNANT_POLLS:
+            return
+        if self.forensic_dumped.get(session):
+            return
+
+        record = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "session": session,
+            "state": "healthy",
+            "action": action,
+            "stagnant_polls": stagnant,
+            "pane_flags": flags,
+            "scored_window": self._pane_scored_window(pane),
+            "captured_tail": self._captured_tail(pane),
+        }
+        try:
+            self._write_forensic_record(record)
+            log.debug(
+                "%s: healthy pane is stagnant for %s poll(s); forensic snapshot written to %s",
+                session,
+                stagnant,
+                FORENSIC_LOG,
+            )
+        except Exception as e:
+            log.error("%s: forensic snapshot failed: %s", session, e)
+        self.forensic_dumped[session] = True
 
     # --- recovery actions ----------------------------------------------------
 
@@ -444,6 +519,7 @@ class Watchdog:
         if self.rl_attempts.get(session):
             action = "reset"
             self._reset_rl(session)
+        self._maybe_dump_forensic(session, pane, flags, action)
         self._poll_log(session, state, action)
 
     def run(self) -> None:

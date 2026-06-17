@@ -9,6 +9,8 @@ No third-party dependencies.
 """
 import sys
 import os
+import json
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -224,6 +226,83 @@ class RecentErrorRecoveryTests(unittest.TestCase):
         w.check("t")
 
         self.assertEqual(sends, ["t"])
+
+
+class ForensicCaptureTests(unittest.TestCase):
+    def setUp(self):
+        self.old_log = wd.FORENSIC_LOG
+        self.old_threshold = wd.FORENSIC_STAGNANT_POLLS
+        self.old_max_bytes = wd.FORENSIC_MAX_BYTES
+
+    def tearDown(self):
+        wd.FORENSIC_LOG = self.old_log
+        wd.FORENSIC_STAGNANT_POLLS = self.old_threshold
+        wd.FORENSIC_MAX_BYTES = self.old_max_bytes
+
+    def _watchdog_for_panes(self, panes):
+        w = wd.Watchdog(sessions=["t"], interval=30, dry_run=True)
+        iterator = iter(panes)
+        w._session_exists = lambda session: True
+        w._claude_running = lambda session: True
+        w._capture = lambda session, lines=50: next(iterator)
+        return w
+
+    def _records(self, path):
+        if not os.path.exists(path):
+            return []
+        with open(path, encoding="utf-8") as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+    def test_healthy_stagnant_unmatched_error_gets_forensic_capture(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wd.FORENSIC_LOG = os.path.join(tmp, "forensic.log")
+            wd.FORENSIC_STAGNANT_POLLS = 1
+            pane = "Claude Code mystery API failure: retryable-ish but unmatched\n❯ "
+            w = self._watchdog_for_panes([pane, pane])
+            sends = []
+            w._send_continue = lambda session: sends.append(session)
+
+            w.check("t")
+            w.check("t")
+
+            records = self._records(wd.FORENSIC_LOG)
+            self.assertEqual(sends, [])
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["state"], "healthy")
+            self.assertEqual(records[0]["stagnant_polls"], 1)
+            self.assertIn("mystery API failure", records[0]["scored_window"])
+            self.assertIn("mystery API failure", records[0]["captured_tail"])
+            self.assertFalse(records[0]["pane_flags"]["transient_near_prompt"])
+
+    def test_healthy_progressing_does_not_capture(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wd.FORENSIC_LOG = os.path.join(tmp, "forensic.log")
+            wd.FORENSIC_STAGNANT_POLLS = 1
+            w = self._watchdog_for_panes([
+                "working line 1\n❯ ",
+                "working line 2\n❯ ",
+            ])
+
+            w.check("t")
+            w.check("t")
+
+            self.assertEqual(self._records(wd.FORENSIC_LOG), [])
+
+    def test_forensic_capture_is_one_per_stagnation_episode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wd.FORENSIC_LOG = os.path.join(tmp, "forensic.log")
+            wd.FORENSIC_STAGNANT_POLLS = 1
+            pane = "unmatched retry display\n❯ "
+            w = self._watchdog_for_panes([pane, pane, pane, "progress\n❯ ", "progress\n❯ "])
+
+            w.check("t")
+            w.check("t")
+            w.check("t")
+            self.assertEqual(len(self._records(wd.FORENSIC_LOG)), 1)
+
+            w.check("t")
+            w.check("t")
+            self.assertEqual(len(self._records(wd.FORENSIC_LOG)), 2)
 
 
 class PatternListSanityTests(unittest.TestCase):

@@ -41,6 +41,9 @@ limit just wastes attempts) and backs off exponentially.
 - Detects the known post-error queued-message stall (`Press up to edit queued
   messages`) and retries `Continue` if Claude cleared the visible error but did
   not actually resume
+- Writes a rate-limited forensic snapshot when a pane scores `healthy` but stops
+  changing, so false negatives produce the real rendered string to inspect next
+  time without auto-injecting into legitimately idle sessions
 - Leaves **real usage limits** alone (detects the "resets at X" / "Rate limit
   reached" state and waits instead of spamming)
 - Dismisses the "How is Claude doing?" feedback overlay if it blocks the prompt
@@ -148,6 +151,10 @@ systemctl --user enable --now claude-code-api-watchdog
 | — | `CCW_PROXIMITY` | `20` | error must be within N lines of the prompt to count |
 | — | `CCW_RECENT_ERROR_POLLS` | `4` | keep a cleared error episode "hot" for N polls |
 | — | `CCW_STUCK_AFTER_ERROR_POLLS` | `1` | repeated queued-message stall polls before retrying `Continue` |
+| — | `CCW_FORENSIC_LOG` | `~/.cache/claude-code-watchdog/forensic.log` | JSONL forensic snapshots for panes that score healthy but remain stagnant |
+| — | `CCW_FORENSIC_STAGNANT_POLLS` | same as `CCW_STUCK_AFTER_ERROR_POLLS` | healthy+stagnant polls before writing one forensic snapshot for the episode |
+| — | `CCW_FORENSIC_CAPTURE_LINES` | `20` | pane tail lines stored in each forensic snapshot |
+| — | `CCW_FORENSIC_MAX_BYTES` | `1048576` | rotate the forensic log to `.1` once it reaches this size |
 | — | `CCW_DEAD_THRESHOLD` | `300` | seconds without a Claude process before restart |
 
 ## How detection works (and its limits)
@@ -165,6 +172,11 @@ the prompt marker. It is deliberately conservative on several axes:
 - The state must persist across `CCW_CONFIRM_POLLS` (default 2) consecutive polls
   before any keystroke is sent — a single-frame redraw or a momentarily-shown
   error won't act.
+- A pane that scores `healthy` but remains unchanged for
+  `CCW_FORENSIC_STAGNANT_POLLS` writes one JSONL forensic snapshot per
+  stagnation episode to `CCW_FORENSIC_LOG`. This is capture-only: it does **not**
+  type `Continue`, because a legitimately-idle session has the same
+  healthy+stagnant shape.
 - If a transient error is still visible in recent scrollback but no longer near
   the prompt, the poll log reports `state=error_cleared`; if Claude then lands
   in the queued-message prompt instead of resuming, the watchdog reports
@@ -182,6 +194,9 @@ Caveats, stated plainly:
   Kitty-protocol CSI-u Enter) is what reliably submits across Claude Code's Ink
   TUI states. If a future Claude Code changes its input handling, this may need
   updating.
+- Pattern-set additions require a real captured string from the forensic log.
+  Do not guess new transient patterns from reports whose pane buffer already
+  rolled.
 - A "busy/working-spinner" guard is shipped: panes showing active-generation
   markers (`esc to interrupt`) are classified healthy and never injected into,
   even if stale error text lingers in nearby scrollback from a just-recovered
