@@ -16,10 +16,16 @@ the machine. The only external commands it runs are the ones you pass via
 
 - **Auto-restart of dead sessions is OFF by default.** `--resume-cmd` is empty
   by default → if a Claude process dies, the watchdog escalates and does NOT
-  relaunch. Opt in to auto-restart by setting `--resume-cmd` explicitly (e.g.
-  `claude --resume latest --dangerously-skip-permissions`). The opt-in flag
-  bypasses Claude Code's permission prompts on the relaunched session — that
-  is appropriate for unattended automation but is a deliberate trust decision.
+  relaunch. Opt in to auto-restart by setting `--resume-cmd` explicitly with
+  `{session_id}` as the per-pane Claude Code session id placeholder (e.g.
+  `claude --resume {session_id} --dangerously-skip-permissions`). Commands
+  using `latest` are refused because they can resume the wrong conversation.
+  The opt-in flag bypasses Claude Code's permission prompts on the relaunched
+  session — that is appropriate for unattended automation but is a deliberate
+  trust decision.
+- **Restart liveness is fail-safe.** Probe errors/timeouts are treated as
+  unknown, not dead. Restarts require multiple definitive dead polls and are
+  suppressed while system load is extreme.
 - Use `--no-restart` for any session where re-running the last action on resume
   would be harmful (e.g. anything that posts, sends, or pays). The watchdog will
   nudge such sessions with `Continue` but never relaunch them.

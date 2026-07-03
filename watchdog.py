@@ -44,6 +44,7 @@ import random
 import shlex
 import subprocess
 import time
+from pathlib import Path
 from typing import Dict, List, Optional
 
 logging.basicConfig(
@@ -56,6 +57,8 @@ log = logging.getLogger(__name__)
 
 DEAD_THRESHOLD = int(os.environ.get("CCW_DEAD_THRESHOLD", "300"))
 MAX_RESTART_ATTEMPTS = int(os.environ.get("CCW_MAX_RESTART_ATTEMPTS", "10"))
+DEAD_CONFIRM_POLLS = int(os.environ.get("CCW_DEAD_CONFIRM_POLLS", "2"))
+RESTART_LOAD_MULTIPLIER = float(os.environ.get("CCW_RESTART_LOAD_MULTIPLIER", "4"))
 
 RL_BACKOFF_BASE = float(os.environ.get("CCW_BACKOFF_BASE", "2"))
 RL_BACKOFF_CAP = float(os.environ.get("CCW_BACKOFF_CAP", "120"))
@@ -69,9 +72,10 @@ CONFIRM_POLLS = int(os.environ.get("CCW_CONFIRM_POLLS", "2"))
 
 # Default resume command is EMPTY → escalate-only, no auto-restart, by default.
 # This is the fail-closed default for a public tool. Opt in to auto-restart by
-# setting --resume-cmd / CCW_RESUME_CMD (e.g.
-#   "claude --resume latest --dangerously-skip-permissions").
+# setting --resume-cmd / CCW_RESUME_CMD with the {session_id} placeholder (e.g.
+#   "claude --resume {session_id} --dangerously-skip-permissions").
 DEFAULT_RESUME_CMD = os.environ.get("CCW_RESUME_CMD", "")
+RESUME_SESSION_PLACEHOLDER = "{session_id}"
 
 # Transient API-error patterns. Anchored to Claude Code's "API Error:" /
 # "Unable to connect" rendering wherever possible so we don't false-match a
@@ -151,6 +155,7 @@ class Watchdog:
         self.rl_escalated: Dict[str, bool] = {}
         self.pending_transient: Dict[str, int] = {}   # consecutive transient polls
         self.restart_count: Dict[str, int] = {}
+        self.definitive_dead_polls: Dict[str, int] = {}
         self.last_fingerprint: Dict[str, str] = {}
         self.stagnant_polls: Dict[str, int] = {}
         self.recent_error_polls: Dict[str, int] = {}
@@ -177,21 +182,42 @@ class Watchdog:
         except Exception:
             return False
 
-    def _claude_running(self, session: str) -> bool:
+    def _pane_pid(self, session: str) -> Optional[str]:
         try:
             pane = subprocess.run(
                 ["tmux", "list-panes", "-t", session, "-F", "#{pane_pid}"],
                 capture_output=True, text=True, timeout=5,
             )
-            if pane.returncode != 0 or not pane.stdout.strip():
-                return False
-            pid = pane.stdout.strip().split("\n")[0]
+            if pane.returncode != 0:
+                log.warning("%s: tmux pane probe failed: %s", session, (pane.stderr or "").strip())
+                return None
+            return pane.stdout.strip().split("\n")[0] if pane.stdout.strip() else None
+        except subprocess.TimeoutExpired:
+            log.warning("%s: tmux pane probe timed out", session)
+            return None
+        except Exception as e:
+            log.warning("%s: tmux pane probe errored: %s", session, e)
+            return None
+
+    def _claude_running(self, session: str) -> Optional[bool]:
+        pid = self._pane_pid(session)
+        if not pid:
+            return None
+        try:
             tree = subprocess.run(
                 ["pstree", "-p", pid], capture_output=True, text=True, timeout=5,
             )
-            return "claude" in tree.stdout.lower() if tree.returncode == 0 else False
-        except Exception:
-            return False
+            if tree.returncode != 0:
+                log.warning("%s: process-tree probe failed for pane pid %s: %s",
+                            session, pid, (tree.stderr or "").strip())
+                return None
+            return "claude" in tree.stdout.lower()
+        except subprocess.TimeoutExpired:
+            log.warning("%s: process-tree probe timed out for pane pid %s", session, pid)
+            return None
+        except Exception as e:
+            log.warning("%s: process-tree probe errored for pane pid %s: %s", session, pid, e)
+            return None
 
     def _send(self, session: str, *args: str, desc: str = "") -> None:
         if self.dry_run:
@@ -383,9 +409,100 @@ class Watchdog:
         self.rl_escalated[session] = False
         self.recent_error_polls[session] = 0
 
+    def _restart_load_too_high(self) -> bool:
+        if RESTART_LOAD_MULTIPLIER <= 0:
+            return False
+        try:
+            load1, _, _ = os.getloadavg()
+            cpu_count = os.cpu_count() or 1
+        except (AttributeError, OSError):
+            return False
+        return load1 > (cpu_count * RESTART_LOAD_MULTIPLIER)
+
+    def _claude_project_dir_for_cwd(self, cwd: str) -> Path:
+        project_name = cwd.replace(os.sep, "-")
+        return Path.home() / ".claude" / "projects" / project_name
+
+    def _session_id_from_jsonl(self, path: Path) -> Optional[str]:
+        try:
+            with path.open(encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        payload = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    session_id = str(payload.get("sessionId") or "").strip()
+                    if session_id:
+                        return session_id
+        except OSError:
+            return None
+        return path.stem or None
+
+    def _claude_session_id_for_pane(self, session: str) -> Optional[str]:
+        pid = self._pane_pid(session)
+        if not pid:
+            return None
+        try:
+            cwd = os.readlink(f"/proc/{pid}/cwd")
+        except OSError as e:
+            log.warning("%s: cannot read pane cwd for pid %s: %s", session, pid, e)
+            return None
+        project_dir = self._claude_project_dir_for_cwd(cwd)
+        try:
+            candidates = sorted(
+                project_dir.glob("*.jsonl"),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )
+        except OSError as e:
+            log.warning("%s: cannot inspect Claude project dir %s: %s", session, project_dir, e)
+            return None
+        for candidate in candidates:
+            session_id = self._session_id_from_jsonl(candidate)
+            if session_id:
+                return session_id
+        log.warning("%s: no Claude session jsonl found in %s", session, project_dir)
+        return None
+
+    def _resume_command_for_session(self, session: str) -> Optional[str]:
+        if not self.resume_cmd:
+            return None
+        try:
+            tokens = shlex.split(self.resume_cmd)
+        except ValueError as e:
+            log.error("%s: invalid resume-cmd %r: %s", session, self.resume_cmd, e)
+            return None
+        if any(token == "latest" or token.endswith("=latest") for token in tokens):
+            log.error(
+                "%s: refusing global resume target 'latest'; use %s so this session resumes its own conversation",
+                session,
+                RESUME_SESSION_PLACEHOLDER,
+            )
+            return None
+        if RESUME_SESSION_PLACEHOLDER not in self.resume_cmd:
+            log.error(
+                "%s: resume-cmd must include %s to avoid resuming the wrong conversation",
+                session,
+                RESUME_SESSION_PLACEHOLDER,
+            )
+            return None
+        session_id = self._claude_session_id_for_pane(session)
+        if not session_id:
+            return None
+        return self.resume_cmd.replace(RESUME_SESSION_PLACEHOLDER, shlex.quote(session_id))
+
     def _restart(self, session: str) -> None:
-        if session in self.no_restart or not self.resume_cmd:
-            reason = "no-restart set" if session in self.no_restart else "no resume-cmd configured"
+        if session in self.no_restart:
+            reason = "no-restart set"
+            log.warning(f"{session}: dead but {reason} — escalating instead of restarting")
+            self._escalate(f"{session}: Claude process gone; not auto-restarting ({reason})")
+            return
+        resume_cmd = self._resume_command_for_session(session)
+        if not resume_cmd:
+            reason = "no safe resume-cmd resolved"
             log.warning(f"{session}: dead but {reason} — escalating instead of restarting")
             self._escalate(f"{session}: Claude process gone; not auto-restarting ({reason})")
             return
@@ -396,8 +513,8 @@ class Watchdog:
             log.error(msg)
             self._escalate(msg)
             return
-        log.warning(f"{session}: restart {n}/{MAX_RESTART_ATTEMPTS}: {self.resume_cmd}")
-        self._send(session, self.resume_cmd, "Enter", desc="restart")
+        log.warning(f"{session}: restart {n}/{MAX_RESTART_ATTEMPTS}: {resume_cmd}")
+        self._send(session, resume_cmd, "Enter", desc="restart")
 
     def _escalate(self, body: str) -> None:
         if not self.escalate_cmd:
@@ -422,18 +539,49 @@ class Watchdog:
         # session whose pane still shows the prompt + a stale error in
         # scrollback would receive keystrokes typed straight into the bare
         # shell. If Claude is gone, the only action is restart/escalate.
-        if not self._claude_running(session):
+        claude_running = self._claude_running(session)
+        if claude_running is None:
+            self.pending_transient[session] = 0
+            self.definitive_dead_polls[session] = 0
+            self._poll_log(session, "probe_unknown", "wait")
+            return
+
+        if not claude_running:
             self.pending_transient[session] = 0   # don't carry error state across a death
+            dead_polls = self.definitive_dead_polls.get(session, 0) + 1
+            self.definitive_dead_polls[session] = dead_polls
             idle = time.time() - self.last_alive.get(session, time.time())
-            if idle > DEAD_THRESHOLD:
-                log.warning(f"{session}: no Claude process for {idle:.0f}s")
+            if idle > DEAD_THRESHOLD and dead_polls >= DEAD_CONFIRM_POLLS:
+                if self._restart_load_too_high():
+                    log.warning(
+                        "%s: no Claude process for %.0fs, but system load is above restart guard — skip restart",
+                        session,
+                        idle,
+                    )
+                    self._poll_log(session, "no_progress", "wait_high_load")
+                    return
+                log.warning(
+                    "%s: no Claude process for %.0fs (%s/%s definitive polls)",
+                    session,
+                    idle,
+                    dead_polls,
+                    DEAD_CONFIRM_POLLS,
+                )
                 self._restart(session)
                 self._poll_log(session, "no_progress", "reset")
             else:
+                log.info(
+                    "%s: Claude process absent (%s/%s definitive polls, %.0fs idle) — waiting",
+                    session,
+                    dead_polls,
+                    DEAD_CONFIRM_POLLS,
+                    idle,
+                )
                 self._poll_log(session, "no_progress", "wait")
             return
 
         # Claude is alive — safe to do pane-state recovery.
+        self.definitive_dead_polls[session] = 0
         self.last_alive[session] = time.time()
         self.restart_count[session] = 0
 
@@ -525,6 +673,7 @@ class Watchdog:
     def run(self) -> None:
         log.info(f"started{' [DRY-RUN]' if self.dry_run else ''}: sessions={self.sessions} "
                  f"interval={self.interval}s confirm_polls={CONFIRM_POLLS} "
+                 f"dead_confirm_polls={DEAD_CONFIRM_POLLS} "
                  f"max_attempts={RL_MAX_ATTEMPTS} "
                  f"auto_restart={'on' if self.resume_cmd else 'off (escalate-only)'} "
                  f"no_restart={sorted(self.no_restart)}")
@@ -551,7 +700,8 @@ def main() -> None:
     p.add_argument("--resume-cmd", default=DEFAULT_RESUME_CMD,
                    help="command to relaunch a dead session. EMPTY (default) = "
                         "escalate-only, never auto-restart. Opt in explicitly, "
-                        "e.g. 'claude --resume latest --dangerously-skip-permissions'")
+                        "e.g. 'claude --resume {session_id} --dangerously-skip-permissions'. "
+                        "Commands using 'latest' are refused.")
     p.add_argument("--escalate-cmd", default=os.environ.get("CCW_ESCALATE_CMD", ""))
     p.add_argument("--dry-run", action="store_true",
                    default=os.environ.get("CCW_DRY_RUN", "").lower() in ("1", "true", "yes"),

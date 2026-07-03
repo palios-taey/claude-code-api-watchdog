@@ -13,6 +13,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -339,6 +340,131 @@ class PatternListSanityTests(unittest.TestCase):
         # Fail-closed: empty default = escalate-only on dead processes.
         # This is the safety-critical default; do not regress.
         self.assertEqual(wd.DEFAULT_RESUME_CMD, "")
+
+
+class DeathRestartSafetyTests(unittest.TestCase):
+    def setUp(self):
+        self.old_dead_confirm_polls = wd.DEAD_CONFIRM_POLLS
+        self.old_dead_threshold = wd.DEAD_THRESHOLD
+
+    def tearDown(self):
+        wd.DEAD_CONFIRM_POLLS = self.old_dead_confirm_polls
+        wd.DEAD_THRESHOLD = self.old_dead_threshold
+
+    def _dead_watchdog(self):
+        wd.DEAD_THRESHOLD = 1
+        w = wd.Watchdog(
+            sessions=["t"],
+            interval=30,
+            resume_cmd="claude --resume {session_id} --dangerously-skip-permissions",
+            dry_run=False,
+        )
+        w._session_exists = lambda session: True
+        w.last_alive["t"] = 0
+        return w
+
+    def test_probe_timeout_is_unknown_and_never_restarts(self):
+        w = self._dead_watchdog()
+        restarts = []
+        w._claude_running = lambda session: None
+        w._restart = lambda session: restarts.append(session)
+
+        w.check("t")
+        w.check("t")
+
+        self.assertEqual(restarts, [])
+        self.assertEqual(w.definitive_dead_polls.get("t", 0), 0)
+
+    def test_extreme_load_suppresses_restart_even_when_definitively_dead(self):
+        wd.DEAD_CONFIRM_POLLS = 1
+        w = self._dead_watchdog()
+        restarts = []
+        w._claude_running = lambda session: False
+        w._restart_load_too_high = lambda: True
+        w._restart = lambda session: restarts.append(session)
+
+        w.check("t")
+
+        self.assertEqual(restarts, [])
+        self.assertEqual(w.definitive_dead_polls["t"], 1)
+
+    def test_truly_dead_session_restarts_with_own_claude_session_id(self):
+        wd.DEAD_CONFIRM_POLLS = 2
+        w = self._dead_watchdog()
+        sends = []
+        w._claude_running = lambda session: False
+        w._restart_load_too_high = lambda: False
+        w._claude_session_id_for_pane = lambda session: "session-abc"
+        w._send = lambda session, *args, desc="": sends.append((session, args, desc))
+
+        w.check("t")
+        self.assertEqual(sends, [])
+
+        w.check("t")
+        self.assertEqual(
+            sends,
+            [("t", ("claude --resume session-abc --dangerously-skip-permissions", "Enter"), "restart")],
+        )
+
+    def test_resume_latest_is_refused(self):
+        w = wd.Watchdog(
+            sessions=["t"],
+            interval=30,
+            resume_cmd="claude --resume latest --dangerously-skip-permissions",
+            dry_run=True,
+        )
+        w._claude_session_id_for_pane = lambda session: "session-abc"
+
+        self.assertIsNone(w._resume_command_for_session("t"))
+
+    def test_resume_equals_latest_is_refused(self):
+        w = wd.Watchdog(
+            sessions=["t"],
+            interval=30,
+            resume_cmd="claude --resume=latest --dangerously-skip-permissions",
+            dry_run=True,
+        )
+        w._claude_session_id_for_pane = lambda session: "session-abc"
+
+        self.assertIsNone(w._resume_command_for_session("t"))
+
+    def test_resume_command_requires_session_id_placeholder(self):
+        w = wd.Watchdog(
+            sessions=["t"],
+            interval=30,
+            resume_cmd="claude --dangerously-skip-permissions",
+            dry_run=True,
+        )
+        w._claude_session_id_for_pane = lambda session: "session-abc"
+
+        self.assertIsNone(w._resume_command_for_session("t"))
+
+    def test_claude_running_timeout_returns_unknown_not_dead(self):
+        w = make_watchdog()
+
+        def timeout_run(*args, **kwargs):
+            raise wd.subprocess.TimeoutExpired(args[0], timeout=5)
+
+        with mock.patch.object(wd.subprocess, "run", timeout_run):
+            self.assertIsNone(w._claude_running("t"))
+
+    def test_session_id_resolved_from_pane_cwd_project_jsonl(self):
+        w = make_watchdog()
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = "/tmp/real-work"
+            project_dir = Path(tmp) / ".claude" / "projects" / "-tmp-real-work"
+            project_dir.mkdir(parents=True)
+            old = project_dir / "old.jsonl"
+            newest = project_dir / "new.jsonl"
+            old.write_text('{"sessionId":"old-session"}\n', encoding="utf-8")
+            newest.write_text('{"type":"last-prompt","sessionId":"new-session"}\n', encoding="utf-8")
+            os.utime(old, (1, 1))
+            os.utime(newest, (2, 2))
+
+            w._pane_pid = lambda session: "1234"
+            with mock.patch.object(wd.Path, "home", return_value=Path(tmp)):
+                with mock.patch.object(wd.os, "readlink", return_value=cwd):
+                    self.assertEqual(w._claude_session_id_for_pane("t"), "new-session")
 
 
 if __name__ == "__main__":
