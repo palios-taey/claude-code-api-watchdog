@@ -48,9 +48,11 @@ limit just wastes attempts) and backs off exponentially.
   reached" state and waits instead of spamming)
 - Dismisses the "How is Claude doing?" feedback overlay if it blocks the prompt
 - **Auto-restart of a dead session is OFF by default** (escalate-only). Opt in
-  with `--resume-cmd`. Use `--no-restart` to force nudge-only for specific
-  sessions even when you've enabled restart globally (e.g. anything that posts,
-  sends, or pays — a resume could re-fire the last action)
+  with `--resume-cmd` and include `{session_id}` so the watchdog resumes the
+  session's own Claude Code conversation. Use `--no-restart` to force
+  nudge-only for specific sessions even when you've enabled restart globally
+  (e.g. anything that posts, sends, or pays — a resume could re-fire the last
+  action)
 - `--dry-run` mode logs every keystroke it *would* send without sending one
 
 ### Disabling
@@ -98,7 +100,7 @@ python3 watchdog.py \
     --sessions mybot,worker1,worker2 \
     --interval 30 \
     --no-restart mybot \
-    --resume-cmd "claude --resume latest --dangerously-skip-permissions" \
+    --resume-cmd "claude --resume {session_id} --dangerously-skip-permissions" \
     --escalate-cmd "/usr/local/bin/notify-me"
 ```
 
@@ -142,9 +144,11 @@ systemctl --user enable --now claude-code-api-watchdog
 | `--dry-run` | `CCW_DRY_RUN` | off | log keystrokes it WOULD send; send nothing. Run this first. |
 | `--interval` | `CCW_INTERVAL` | `30` | poll seconds |
 | `--no-restart` | `CCW_NO_RESTART` | (none) | sessions to nudge-only, never auto-restart |
-| `--resume-cmd` | `CCW_RESUME_CMD` | **(empty = escalate-only)** | how to relaunch a dead session. Empty default never auto-restarts; opt in explicitly (e.g. `claude --resume latest --dangerously-skip-permissions`). |
+| `--resume-cmd` | `CCW_RESUME_CMD` | **(empty = escalate-only)** | how to relaunch a dead session. Empty default never auto-restarts; opt in explicitly with `{session_id}` as the per-pane Claude Code session id placeholder (e.g. `claude --resume {session_id} --dangerously-skip-permissions`). Commands using `latest` are refused. |
 | `--escalate-cmd` | `CCW_ESCALATE_CMD` | (none) | command run on escalation; receives the message as one arg |
 | — | `CCW_CONFIRM_POLLS` | `2` | consecutive transient-error polls required before acting |
+| — | `CCW_DEAD_CONFIRM_POLLS` | `2` | consecutive definitive "Claude process absent" polls required before restart |
+| — | `CCW_RESTART_LOAD_MULTIPLIER` | `4` | skip dead-session restarts when 1-minute load average exceeds this multiple of CPU count; set `0` to disable the load guard |
 | — | `CCW_MAX_ATTEMPTS` | `10` | Continue attempts before escalating + halting |
 | — | `CCW_BACKOFF_BASE` | `2` | backoff base seconds |
 | — | `CCW_BACKOFF_CAP` | `120` | backoff cap seconds |
