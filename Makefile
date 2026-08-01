@@ -1,4 +1,4 @@
-.PHONY: install uninstall test
+.PHONY: install uninstall
 
 PREFIX ?= /usr/local
 
@@ -12,6 +12,3 @@ uninstall:
 	@echo "Removing claude-code-api-watchdog from $(PREFIX)/bin..."
 	@rm -f $(PREFIX)/bin/claude-code-api-watchdog
 	@echo "Done."
-
-test:
-	@python3 -m unittest discover -s tests -v
