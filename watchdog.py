@@ -56,6 +56,9 @@ log = logging.getLogger(__name__)
 
 DEAD_THRESHOLD = int(os.environ.get("CCW_DEAD_THRESHOLD", "300"))
 MAX_RESTART_ATTEMPTS = int(os.environ.get("CCW_MAX_RESTART_ATTEMPTS", "10"))
+# Consecutive DEFINITIVELY-missing tmux polls required before one escalation.
+# A probe error/timeout is UNKNOWN and never counts toward this (fail-closed on alert).
+DEAD_CONFIRM_POLLS = int(os.environ.get("CCW_DEAD_CONFIRM_POLLS", "2"))
 
 RL_BACKOFF_BASE = float(os.environ.get("CCW_BACKOFF_BASE", "2"))
 RL_BACKOFF_CAP = float(os.environ.get("CCW_BACKOFF_CAP", "120"))
@@ -155,6 +158,8 @@ class Watchdog:
         self.stagnant_polls: Dict[str, int] = {}
         self.recent_error_polls: Dict[str, int] = {}
         self.forensic_dumped: Dict[str, bool] = {}
+        self.missing_polls: Dict[str, int] = {}        # consecutive definitive-missing tmux polls
+        self.missing_escalated: Dict[str, bool] = {}   # one-shot missing-session escalation latch
 
     # --- tmux helpers --------------------------------------------------------
 
@@ -168,14 +173,26 @@ class Watchdog:
         except Exception:
             return ""
 
-    def _session_exists(self, session: str) -> bool:
+    def _session_exists(self, session: str) -> Optional[bool]:
+        """Tri-state tmux session probe:
+          True  = session present
+          False = tmux definitively reports the session absent
+          None  = probe failed/timed out or an unexpected tmux error -> UNKNOWN
+        UNKNOWN must never be treated as missing (fail-closed on escalation)."""
         try:
-            return subprocess.run(
+            r = subprocess.run(
                 ["tmux", "has-session", "-t", session],
-                capture_output=True, timeout=5,
-            ).returncode == 0
+                capture_output=True, text=True, timeout=5,
+            )
         except Exception:
+            return None
+        if r.returncode == 0:
+            return True
+        err = (r.stderr or "").lower()
+        if "can't find session" in err or "no such session" in err:
             return False
+        # non-zero with an unexpected error (no tmux server, socket error, ...) -> UNKNOWN
+        return None
 
     def _claude_running(self, session: str) -> bool:
         try:
@@ -411,11 +428,48 @@ class Watchdog:
         except Exception as e:
             log.error(f"escalate command failed: {e}")
 
+    def _handle_missing(self, session: str) -> None:
+        """Session tmux is DEFINITIVELY absent. Debounce over DEAD_CONFIRM_POLLS
+        consecutive polls, then escalate exactly once (latched). Never auto-create or
+        resume: a missing tmux has no pane-scoped cwd/session identity to recreate
+        safely, so recovery is a human/operator action."""
+        n = self.missing_polls.get(session, 0) + 1
+        self.missing_polls[session] = n
+        if n < DEAD_CONFIRM_POLLS:
+            self._poll_log(session, "tmux_missing", f"debounce {n}/{DEAD_CONFIRM_POLLS}")
+            return
+        if not self.missing_escalated.get(session):
+            msg = (f"{session}: tmux session missing for {n} consecutive polls "
+                   f"(~{n * self.interval}s) — no reader running. NOT auto-creating "
+                   f"(missing tmux has no pane-scoped identity); restore the session manually.")
+            log.error(msg)
+            self._escalate(msg)
+            self.missing_escalated[session] = True
+            self._poll_log(session, "tmux_missing", "escalated")
+        else:
+            self._poll_log(session, "tmux_missing", "latched")
+
+    def _reset_missing(self, session: str) -> None:
+        """Session is present again -> re-arm the missing detector for a future death."""
+        if self.missing_polls.get(session) or self.missing_escalated.get(session):
+            log.info(f"{session}: tmux session present again — missing-detector re-armed")
+        self.missing_polls[session] = 0
+        self.missing_escalated[session] = False
+
     # --- main loop -----------------------------------------------------------
 
     def check(self, session: str) -> None:
-        if not self._session_exists(session):
+        exists = self._session_exists(session)
+        if exists is None:
+            # Probe UNKNOWN (tmux error/timeout). Fail-closed: never escalate on an
+            # unknown, and hold the missing debounce/latch as-is (neither count nor rearm).
+            self._poll_log(session, "tmux_probe_unknown", "wait")
             return
+        if exists is False:
+            self._handle_missing(session)
+            return
+        # exists is True -> session present; clear any prior missing state (recovery re-arm).
+        self._reset_missing(session)
 
         # Liveness FIRST. Never inject Continue/Escape/0 into a pane unless a
         # Claude process is actually running in it — otherwise a crashed
