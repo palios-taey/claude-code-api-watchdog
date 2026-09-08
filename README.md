@@ -31,7 +31,7 @@ limit just wastes attempts) and backs off exponentially.
 - Requires the transient-error state on **two consecutive polls** before acting
   (debounce against single-frame redraws and momentarily-displayed error text)
 - Logs every poll in a machine-greppable line:
-  `"[<ts>] [watchdog] poll session=<X> state=<healthy|error_visible|error_cleared|stuck_after_error|no_progress> action=<none|wait|continue|reset>"`
+  `"[<ts>] [watchdog] poll session=<X> state=<healthy|error_visible|error_cleared|stuck_after_error|no_progress|process_probe_unknown> action=<none|wait|continue|reset|escalate|restart>"`
 - Injects `Continue` with **exponential backoff** (2s → 4s → … → 120s cap) and a
   **10-attempt cap**, then escalates and stops (no infinite hammering within an
   error episode; a session that flaps healthy↔error re-arms per episode)
@@ -51,6 +51,9 @@ limit just wastes attempts) and backs off exponentially.
   with `--resume-cmd`. Use `--no-restart` to force nudge-only for specific
   sessions even when you've enabled restart globally (e.g. anything that posts,
   sends, or pays — a resume could re-fire the last action)
+- Process-probe errors and timeouts are **UNKNOWN, never dead**. Before any
+  opt-in restart, the watchdog performs a fresh process-tree check and suppresses
+  the restart unless that second check also definitively finds no Claude process
 - `--dry-run` mode logs every keystroke it *would* send without sending one
 
 ### Disabling

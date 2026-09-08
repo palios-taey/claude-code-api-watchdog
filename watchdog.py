@@ -177,21 +177,36 @@ class Watchdog:
         except Exception:
             return False
 
-    def _claude_running(self, session: str) -> bool:
+    def _claude_running(self, session: str) -> Optional[bool]:
+        """Return True/False only from a conclusive process probe.
+
+        None means the probe itself failed or timed out. Probe uncertainty must
+        never be promoted to process death because the caller can inject a
+        resume command into this pane.
+        """
         try:
             pane = subprocess.run(
-                ["tmux", "list-panes", "-t", session, "-F", "#{pane_pid}"],
+                [
+                    "tmux", "list-panes", "-t", session, "-F",
+                    "#{pane_pid}\t#{pane_current_command}",
+                ],
                 capture_output=True, text=True, timeout=5,
             )
             if pane.returncode != 0 or not pane.stdout.strip():
-                return False
-            pid = pane.stdout.strip().split("\n")[0]
+                return None
+            fields = pane.stdout.strip().split("\n")[0].split("\t", 1)
+            pid = fields[0]
+            current_command = fields[1].strip().lower() if len(fields) == 2 else ""
+            if current_command == "claude":
+                return True
             tree = subprocess.run(
                 ["pstree", "-p", pid], capture_output=True, text=True, timeout=5,
             )
-            return "claude" in tree.stdout.lower() if tree.returncode == 0 else False
-        except Exception:
-            return False
+            if tree.returncode != 0:
+                return None
+            return "claude" in tree.stdout.lower()
+        except (OSError, subprocess.SubprocessError):
+            return None
 
     def _send(self, session: str, *args: str, desc: str = "") -> None:
         if self.dry_run:
@@ -383,21 +398,30 @@ class Watchdog:
         self.rl_escalated[session] = False
         self.recent_error_polls[session] = 0
 
-    def _restart(self, session: str) -> None:
+    def _restart(self, session: str) -> str:
+        final_liveness = self._claude_running(session)
+        if final_liveness is not False:
+            state = "alive" if final_liveness else "unknown"
+            log.warning(f"{session}: restart suppressed; final process probe is {state}")
+            if final_liveness:
+                self.last_alive[session] = time.time()
+                self.restart_count[session] = 0
+            return "wait"
         if session in self.no_restart or not self.resume_cmd:
             reason = "no-restart set" if session in self.no_restart else "no resume-cmd configured"
             log.warning(f"{session}: dead but {reason} — escalating instead of restarting")
             self._escalate(f"{session}: Claude process gone; not auto-restarting ({reason})")
-            return
+            return "escalate"
         n = self.restart_count.get(session, 0) + 1
         self.restart_count[session] = n
         if n > MAX_RESTART_ATTEMPTS:
             msg = f"{session}: exceeded {MAX_RESTART_ATTEMPTS} restart attempts — giving up"
             log.error(msg)
             self._escalate(msg)
-            return
+            return "escalate"
         log.warning(f"{session}: restart {n}/{MAX_RESTART_ATTEMPTS}: {self.resume_cmd}")
         self._send(session, self.resume_cmd, "Enter", desc="restart")
+        return "restart"
 
     def _escalate(self, body: str) -> None:
         if not self.escalate_cmd:
@@ -422,13 +446,17 @@ class Watchdog:
         # session whose pane still shows the prompt + a stale error in
         # scrollback would receive keystrokes typed straight into the bare
         # shell. If Claude is gone, the only action is restart/escalate.
-        if not self._claude_running(session):
+        claude_running = self._claude_running(session)
+        if claude_running is None:
+            self._poll_log(session, "process_probe_unknown", "wait")
+            return
+        if claude_running is False:
             self.pending_transient[session] = 0   # don't carry error state across a death
             idle = time.time() - self.last_alive.get(session, time.time())
             if idle > DEAD_THRESHOLD:
                 log.warning(f"{session}: no Claude process for {idle:.0f}s")
-                self._restart(session)
-                self._poll_log(session, "no_progress", "reset")
+                action = self._restart(session)
+                self._poll_log(session, "no_progress", action)
             else:
                 self._poll_log(session, "no_progress", "wait")
             return
